@@ -1,11 +1,6 @@
-#include <mbedtls/md.h>
-#include <mbedtls/ecp.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/ecdsa.h>
-#include <mbedtls/ecdh.h>
-#include <mbedtls/cipher.h>
+#include <psa/crypto.h>
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -35,33 +30,55 @@ static uint32_t big_endian32(uint32_t x)
     return x_be;
 }
 
+// Imports raw key material into a volatile PSA key. psa_import_key validates
+// the key, so this also covers the range check for private keys and the
+// on-curve check for public keys.
+static int import_key(
+    psa_key_type_t type, size_t bits,
+    const uint8_t* data, size_t data_len,
+    psa_key_usage_t usage, psa_algorithm_t alg,
+    psa_key_id_t* key)
+{
+    int err = 0;
+
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, type);
+    psa_set_key_bits(&attributes, bits);
+    psa_set_key_usage_flags(&attributes, usage);
+    psa_set_key_algorithm(&attributes, alg);
+
+    MBEDTLS_CHK(psa_crypto_init());
+    MBEDTLS_CHK(psa_import_key(&attributes, data, data_len, key));
+
+exit:
+    psa_reset_key_attributes(&attributes);
+
+    return err;
+}
+
+static int import_hmac_key(const uint8_t* data, size_t data_len, psa_key_id_t* key)
+{
+    return import_key(
+        PSA_KEY_TYPE_HMAC,
+        data_len * CHAR_BIT,
+        data, data_len,
+        PSA_KEY_USAGE_SIGN_MESSAGE, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+        key);
+}
+
 int sdcpcli_gen_rand(uint8_t* rand, size_t rand_len)
 {
     if (rand == NULL || rand_len == 0)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
 
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    mbedtls_entropy_context entropy;
-    mbedtls_entropy_init(&entropy);
-
-    const char personalization[] = "sdcpcli_gen_rand";
-    MBEDTLS_CHK(mbedtls_ctr_drbg_seed(
-        &ctr_drbg,
-        mbedtls_entropy_func, &entropy,
-        (uint8_t*)personalization, sizeof(personalization)));
-
-    MBEDTLS_CHK(mbedtls_ctr_drbg_random(&ctr_drbg, rand, rand_len));
+    MBEDTLS_CHK(psa_crypto_init());
+    MBEDTLS_CHK(psa_generate_random(rand, rand_len));
 
 exit:
-    mbedtls_entropy_free(&entropy);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-
     return err;
 }
 
@@ -76,95 +93,79 @@ int sdcpcli_kdf(
         (context == NULL && context_len > 0) ||
         output == NULL || output_len > UINT32_MAX / CHAR_BIT)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
+    size_t olen = 0;
+    const psa_algorithm_t alg = PSA_ALG_HMAC(PSA_ALG_SHA_256);
     const uint32_t n = (uint32_t)((output_len + SDCP_DIGEST_SIZE_V1 - 1) / SDCP_DIGEST_SIZE_V1);
     const uint32_t l_bits_be = big_endian32((uint32_t)output_len * 8);
 
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
+    psa_key_id_t hmac_key = PSA_KEY_ID_NULL;
+    psa_mac_operation_t op = PSA_MAC_OPERATION_INIT;
+    uint8_t tmp[SDCP_DIGEST_SIZE_V1] = { 0 };
 
-    MBEDTLS_CHK(mbedtls_md_setup(
-        &ctx,
-        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-        1)); // HMAC
-
-    MBEDTLS_CHK(mbedtls_md_hmac_starts(&ctx, key, key_len));
+    MBEDTLS_CHK(import_hmac_key(key, key_len, &hmac_key));
     for (uint32_t i = 0; i < n; ++i)
     {
         uint32_t i_be = big_endian32(i + 1);
         size_t offset = i * SDCP_DIGEST_SIZE_V1;
         size_t bytes_remaining = output_len - offset;
-        uint8_t tmp[SDCP_DIGEST_SIZE_V1] = { 0 };
 
         // i_be || label || context || l_bits_be
-        MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, (uint8_t*)&i_be, sizeof(i_be)));
-        MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, (uint8_t*)label, strlen(label) + 1));
+        MBEDTLS_CHK(psa_mac_sign_setup(&op, hmac_key, alg));
+        MBEDTLS_CHK(psa_mac_update(&op, (uint8_t*)&i_be, sizeof(i_be)));
+        MBEDTLS_CHK(psa_mac_update(&op, (uint8_t*)label, strlen(label) + 1));
         if (context_len > 0)
         {
-            MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, context, context_len));
+            MBEDTLS_CHK(psa_mac_update(&op, context, context_len));
         }
-        MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, (uint8_t*)&l_bits_be, sizeof(l_bits_be)));
+        MBEDTLS_CHK(psa_mac_update(&op, (uint8_t*)&l_bits_be, sizeof(l_bits_be)));
 
-        MBEDTLS_CHK(mbedtls_md_hmac_finish(&ctx, tmp));
-        MBEDTLS_CHK(mbedtls_md_hmac_reset(&ctx));
+        MBEDTLS_CHK(psa_mac_sign_finish(&op, tmp, sizeof(tmp), &olen));
 
         memcpy(output + offset, tmp, bytes_remaining < 32 ? bytes_remaining : 32);
     }
 
 exit:
-    mbedtls_md_free(&ctx);
+    psa_mac_abort(&op);
+    psa_destroy_key(hmac_key);
+    secure_zero_memory(tmp, sizeof(tmp));
 
-    return 0;
+    return err;
 }
 
 int sdcpcli_keygen(sdcp_keypair* keypair)
 {
     if (keypair == NULL)
     {
-        return MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
     size_t olen = 0;
-    const char personalization[] = "sdcpcli_keygen";
 
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_ctr_drbg_init(&ctr_drbg);
+    psa_key_id_t key = PSA_KEY_ID_NULL;
 
-    mbedtls_entropy_context entropy;
-    mbedtls_entropy_init(&entropy);
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&attributes, SDCP_PRIVATE_KEY_SIZE_V1 * CHAR_BIT);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_EXPORT);
 
-    mbedtls_ecp_keypair mbedtls_keypair;
-    mbedtls_ecp_keypair_init(&mbedtls_keypair);
+    MBEDTLS_CHK(psa_crypto_init());
+    MBEDTLS_CHK(psa_generate_key(&attributes, &key));
 
-    MBEDTLS_CHK(mbedtls_ctr_drbg_seed(
-        &ctr_drbg,
-        mbedtls_entropy_func, &entropy,
-        (const uint8_t*)personalization, sizeof(personalization)));
-
-    MBEDTLS_CHK(mbedtls_ecp_gen_key(
-        MBEDTLS_ECP_DP_SECP256R1,
-        &mbedtls_keypair,
-        mbedtls_ctr_drbg_random, &ctr_drbg));
-
-    MBEDTLS_CHK(mbedtls_ecp_point_write_binary(
-        &mbedtls_keypair.grp, &mbedtls_keypair.Q,
-        MBEDTLS_ECP_PF_UNCOMPRESSED,
-        &olen, keypair->pk, sizeof(keypair->pk)));
+    // 0x04||x||y
+    MBEDTLS_CHK(psa_export_public_key(key, keypair->pk, sizeof(keypair->pk), &olen));
     assert(olen == sizeof(keypair->pk));
 
-    assert(mbedtls_mpi_size(&mbedtls_keypair.d) == sizeof(keypair->sk));
-    MBEDTLS_CHK(mbedtls_mpi_write_binary(
-        &mbedtls_keypair.d,
-        keypair->sk, sizeof(keypair->sk)));
+    MBEDTLS_CHK(psa_export_key(key, keypair->sk, sizeof(keypair->sk), &olen));
+    assert(olen == sizeof(keypair->sk));
 
 exit:
-    mbedtls_ecp_keypair_free(&mbedtls_keypair);
-    mbedtls_entropy_free(&entropy);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
+    psa_destroy_key(key);
+    psa_reset_key_attributes(&attributes);
 
     return err;
 }
@@ -173,10 +174,17 @@ int sdcpcli_hash(const uint8_t* data, size_t len, uint8_t* hash, size_t hash_len
 {
     if (data == NULL || len == 0 || hash == NULL || hash_len < SDCP_DIGEST_SIZE_V1)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
-    return mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), data, len, hash);
+    int err = 0;
+    size_t olen = 0;
+
+    MBEDTLS_CHK(psa_crypto_init());
+    MBEDTLS_CHK(psa_hash_compute(PSA_ALG_SHA_256, data, len, hash, hash_len, &olen));
+
+exit:
+    return err;
 }
 
 int sdcpcli_sign_hash(
@@ -188,36 +196,36 @@ int sdcpcli_sign_hash(
         hash == NULL || hash_len < SDCP_DIGEST_SIZE_V1 ||
         signature == NULL)
     {
-        return MBEDTLS_ERR_MPI_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
+    size_t olen = 0;
+    const psa_algorithm_t alg = PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256);
 
-    mbedtls_mpi d, r, s;
-    mbedtls_mpi_init(&d);
-    mbedtls_mpi_init(&r);
-    mbedtls_mpi_init(&s);
+    psa_key_id_t key = PSA_KEY_ID_NULL;
 
-    mbedtls_ecp_group grp;
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    // r||s
+    uint8_t sig[SDCP_SIGNATURE_SIZE_V1] = { 0 };
 
-    MBEDTLS_CHK(mbedtls_mpi_read_binary(&d, sk, SDCP_PRIVATE_KEY_SIZE_V1));
-    MBEDTLS_CHK(mbedtls_ecp_check_privkey(&grp, &d));
+    MBEDTLS_CHK(import_key(
+        PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1),
+        SDCP_PRIVATE_KEY_SIZE_V1 * CHAR_BIT,
+        sk, SDCP_PRIVATE_KEY_SIZE_V1,
+        PSA_KEY_USAGE_SIGN_HASH, alg,
+        &key));
 
-    MBEDTLS_CHK(mbedtls_ecdsa_sign_det(
-        &grp, &r, &s, &d,
+    MBEDTLS_CHK(psa_sign_hash(
+        key, alg,
         hash, SDCP_DIGEST_SIZE_V1,
-        MBEDTLS_MD_SHA256));
+        sig, sizeof(sig), &olen));
+    assert(olen == sizeof(sig));
 
-    MBEDTLS_CHK(mbedtls_mpi_write_binary(&r, signature->r, sizeof(signature->r)));
-    MBEDTLS_CHK(mbedtls_mpi_write_binary(&s, signature->s, sizeof(signature->s)));
+    memcpy(signature->r, sig, sizeof(signature->r));
+    memcpy(signature->s, sig + sizeof(signature->r), sizeof(signature->s));
 
 exit:
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&s);
-    mbedtls_mpi_free(&r);
-    mbedtls_mpi_free(&d);
+    psa_destroy_key(key);
 
     return err;
 }
@@ -231,35 +239,35 @@ int sdcpcli_verify(
         hash == NULL || hash_len < SDCP_DIGEST_SIZE_V1 ||
         signature == NULL)
     {
-        return MBEDTLS_ERR_MPI_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
+    const psa_algorithm_t alg = PSA_ALG_ECDSA(PSA_ALG_SHA_256);
 
-    mbedtls_ecp_point q;
-    mbedtls_ecp_point_init(&q);
+    psa_key_id_t key = PSA_KEY_ID_NULL;
 
-    mbedtls_mpi r, s;
-    mbedtls_mpi_init(&r);
-    mbedtls_mpi_init(&s);
+    // r||s
+    uint8_t sig[SDCP_SIGNATURE_SIZE_V1] = { 0 };
+    memcpy(sig, signature->r, sizeof(signature->r));
+    memcpy(sig + sizeof(signature->r), signature->s, sizeof(signature->s));
 
-    mbedtls_ecp_group grp;
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    MBEDTLS_CHK(import_key(
+        PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1),
+        SDCP_PRIVATE_KEY_SIZE_V1 * CHAR_BIT,
+        pk, pk_len,
+        PSA_KEY_USAGE_VERIFY_HASH, alg,
+        &key));
 
-    MBEDTLS_CHK(mbedtls_ecp_point_read_binary(&grp, &q, pk, pk_len));
-    MBEDTLS_CHK(mbedtls_ecp_check_pubkey(&grp, &q));
-
-    MBEDTLS_CHK(mbedtls_mpi_read_binary(&r, signature->r, sizeof(signature->r)));
-    MBEDTLS_CHK(mbedtls_mpi_read_binary(&s, signature->s, sizeof(signature->r)));
-
-    MBEDTLS_CHK(mbedtls_ecdsa_verify(&grp, hash, hash_len, &q, &r, &s));
+    // ECDSA only uses the leftmost bits of the hash up to the size of the
+    // group order, so longer hashes are truncated as before.
+    MBEDTLS_CHK(psa_verify_hash(
+        key, alg,
+        hash, SDCP_DIGEST_SIZE_V1,
+        sig, sizeof(sig)));
 
 exit:
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&s);
-    mbedtls_mpi_free(&r);
-    mbedtls_ecp_point_free(&q);
+    psa_destroy_key(key);
 
     return err;
 }
@@ -273,55 +281,30 @@ int sdcpcli_secret_agreement(
         sk == NULL || sk_len < SDCP_PRIVATE_KEY_SIZE_V1 ||
         secret == NULL || secret_len < SDCP_CURVE_FIELD_SIZE_V1)
     {
-        return MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
+    size_t olen = 0;
 
-    mbedtls_ecp_point q;
-    mbedtls_ecp_point_init(&q);
+    psa_key_id_t key = PSA_KEY_ID_NULL;
 
-    mbedtls_mpi d, z;
-    mbedtls_mpi_init(&d);
-    mbedtls_mpi_init(&z);
+    MBEDTLS_CHK(import_key(
+        PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1),
+        SDCP_PRIVATE_KEY_SIZE_V1 * CHAR_BIT,
+        sk, SDCP_PRIVATE_KEY_SIZE_V1,
+        PSA_KEY_USAGE_DERIVE, PSA_ALG_ECDH,
+        &key));
 
-    mbedtls_ecp_group grp;
-    mbedtls_ecp_group_init(&grp);
-    mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
-
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    mbedtls_entropy_context entropy;
-    mbedtls_entropy_init(&entropy);
-
-    const char personalization[] = "sdcpcli_secret_agreement";
-
-    MBEDTLS_CHK(mbedtls_ecp_point_read_binary(&grp, &q, pk, SDCP_PUBLIC_KEY_SIZE_V1));
-    MBEDTLS_CHK(mbedtls_ecp_check_pubkey(&grp, &q));
-
-    MBEDTLS_CHK(mbedtls_mpi_read_binary(&d, sk, SDCP_PRIVATE_KEY_SIZE_V1));
-    MBEDTLS_CHK(mbedtls_ecp_check_privkey(&grp, &d));
-
-    MBEDTLS_CHK(mbedtls_ctr_drbg_seed(
-        &ctr_drbg,
-        mbedtls_entropy_func, &entropy,
-        (const uint8_t*)personalization, sizeof(personalization)));
-
-    MBEDTLS_CHK(mbedtls_ecdh_compute_shared(
-        &grp, &z, &q, &d,
-        mbedtls_ctr_drbg_random, &ctr_drbg));
-
-    assert(mbedtls_mpi_size(&z) == SDCP_CURVE_FIELD_SIZE_V1);
-    MBEDTLS_CHK(mbedtls_mpi_write_binary(&z, secret, SDCP_CURVE_FIELD_SIZE_V1));
+    // The shared secret is the big-endian x-coordinate of the shared point.
+    MBEDTLS_CHK(psa_raw_key_agreement(
+        PSA_ALG_ECDH, key,
+        pk, SDCP_PUBLIC_KEY_SIZE_V1,
+        secret, SDCP_CURVE_FIELD_SIZE_V1, &olen));
+    assert(olen == SDCP_CURVE_FIELD_SIZE_V1);
 
 exit:
-    mbedtls_entropy_free(&entropy);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_ecp_group_free(&grp);
-    mbedtls_mpi_free(&z);
-    mbedtls_mpi_free(&d);
-    mbedtls_ecp_point_free(&q);
+    psa_destroy_key(key);
 
     return err;
 }
@@ -336,7 +319,7 @@ int sdcpcli_derive_master_secret(
     if (rh == NULL || rh_len < SDCP_RANDOM_SIZE_V1 ||
         rd == NULL || rd_len < SDCP_RANDOM_SIZE_V1)
     {
-        return MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
@@ -383,13 +366,13 @@ int sdcpcli_sign_firmware(
 {
     if (fw == NULL || fw_len == 0 || fw_sig == NULL)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
+    size_t olen = 0;
 
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
+    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
 
     uint8_t md[SDCP_DIGEST_SIZE_V1] = { 0 };
 
@@ -401,26 +384,21 @@ int sdcpcli_sign_firmware(
 
     MBEDTLS_CHK(sdcpcli_keygen(fw_keypair));
 
-    MBEDTLS_CHK(mbedtls_md_setup(
-        &ctx,
-        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-        0));
+    MBEDTLS_CHK(psa_hash_setup(&op, PSA_ALG_SHA_256));
+    MBEDTLS_CHK(psa_hash_update(&op, fw, fw_len));
+    MBEDTLS_CHK(psa_hash_finish(&op, fw_sig->hash, sizeof(fw_sig->hash), &olen));
 
-    MBEDTLS_CHK(mbedtls_md_starts(&ctx));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, fw, fw_len));
-    MBEDTLS_CHK(mbedtls_md_finish(&ctx, fw_sig->hash));
-
-    MBEDTLS_CHK(mbedtls_md_starts(&ctx));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, header, sizeof(header)));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, fw_sig->hash, sizeof(fw_sig->hash)));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, fw_keypair->pk, sizeof(fw_keypair->pk)));
-    MBEDTLS_CHK(mbedtls_md_finish(&ctx, md));
+    MBEDTLS_CHK(psa_hash_setup(&op, PSA_ALG_SHA_256));
+    MBEDTLS_CHK(psa_hash_update(&op, header, sizeof(header)));
+    MBEDTLS_CHK(psa_hash_update(&op, fw_sig->hash, sizeof(fw_sig->hash)));
+    MBEDTLS_CHK(psa_hash_update(&op, fw_keypair->pk, sizeof(fw_keypair->pk)));
+    MBEDTLS_CHK(psa_hash_finish(&op, md, sizeof(md), &olen));
 
     // Sig(sk_d, H(C001||H(fw)||pk_f))
     MBEDTLS_CHK(sdcpcli_sign_hash(skd, skd_len, md, sizeof(md), &fw_sig->sig));
 
 exit:
-    mbedtls_md_free(&ctx);
+    psa_hash_abort(&op);
 
     return err;
 }
@@ -439,31 +417,28 @@ int sdcpcli_hash_claim(
         sd == NULL || sm == NULL ||
         hash == NULL || hash_len < SDCP_DIGEST_SIZE_V1)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
+    size_t olen = 0;
 
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
+    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
 
-    MBEDTLS_CHK(mbedtls_md_setup(
-        &ctx,
-        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-        0));
+    MBEDTLS_CHK(psa_crypto_init());
 
     // c <- (cert_m, pk_d, pk_f, h_f, s_m, s_d)
-    MBEDTLS_CHK(mbedtls_md_starts(&ctx));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, cert, cert_len));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, pkd, SDCP_PUBLIC_KEY_SIZE_V1));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, pkf, SDCP_PUBLIC_KEY_SIZE_V1));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, sd->hash, sizeof(sd->hash)));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, (const uint8_t*)sm, sizeof(*sm)));
-    MBEDTLS_CHK(mbedtls_md_update(&ctx, (const uint8_t*)&sd->sig, sizeof(sd->sig)));
-    MBEDTLS_CHK(mbedtls_md_finish(&ctx, hash));
+    MBEDTLS_CHK(psa_hash_setup(&op, PSA_ALG_SHA_256));
+    MBEDTLS_CHK(psa_hash_update(&op, cert, cert_len));
+    MBEDTLS_CHK(psa_hash_update(&op, pkd, SDCP_PUBLIC_KEY_SIZE_V1));
+    MBEDTLS_CHK(psa_hash_update(&op, pkf, SDCP_PUBLIC_KEY_SIZE_V1));
+    MBEDTLS_CHK(psa_hash_update(&op, sd->hash, sizeof(sd->hash)));
+    MBEDTLS_CHK(psa_hash_update(&op, (const uint8_t*)sm, sizeof(*sm)));
+    MBEDTLS_CHK(psa_hash_update(&op, (const uint8_t*)&sd->sig, sizeof(sd->sig)));
+    MBEDTLS_CHK(psa_hash_finish(&op, hash, hash_len, &olen));
 
 exit:
-    mbedtls_md_free(&ctx);
+    psa_hash_abort(&op);
 
     return err;
 
@@ -481,29 +456,28 @@ static int mac_with_label(
         (data == NULL && count > 0) ||
         mac == NULL || mac_len < SDCP_DIGEST_SIZE_V1)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
+    size_t olen = 0;
 
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
+    psa_key_id_t hmac_key = PSA_KEY_ID_NULL;
+    psa_mac_operation_t op = PSA_MAC_OPERATION_INIT;
 
-    MBEDTLS_CHK(mbedtls_md_setup(
-        &ctx,
-        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-        1)); // HMAC
+    MBEDTLS_CHK(import_hmac_key(keys->s, sizeof(keys->s), &hmac_key));
 
-    MBEDTLS_CHK(mbedtls_md_hmac_starts(&ctx, keys->s, sizeof(keys->s)));
-    MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, (const uint8_t*)label, strlen(label) + 1));
+    MBEDTLS_CHK(psa_mac_sign_setup(&op, hmac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256)));
+    MBEDTLS_CHK(psa_mac_update(&op, (const uint8_t*)label, strlen(label) + 1));
     for (size_t i = 0; i < count; ++i)
     {
-        MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, data[i].ptr, data[i].len));
+        MBEDTLS_CHK(psa_mac_update(&op, data[i].ptr, data[i].len));
     }
-    MBEDTLS_CHK(mbedtls_md_hmac_finish(&ctx, mac));
+    MBEDTLS_CHK(psa_mac_sign_finish(&op, mac, mac_len, &olen));
 
 exit:
-    mbedtls_md_free(&ctx);
+    psa_mac_abort(&op);
+    psa_destroy_key(hmac_key);
 
     return err;
 }
@@ -515,7 +489,7 @@ int sdcpcli_mac_claim_hash(
 {
     if (hash == NULL || hash_len < SDCP_DIGEST_SIZE_V1)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     mac_data data[1] = { 0 };
@@ -536,7 +510,7 @@ int sdcpcli_mac_reconnect(
 {
     if (rand == NULL || rand_len < SDCP_RANDOM_SIZE_V1)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     mac_data data[1] = { 0 };
@@ -561,7 +535,7 @@ int sdcpcli_mac_encrypted_sample(
         iv == NULL || iv_len < SDCP_ENCRYPTION_BLOCK_SIZE_V1 ||
         enc == NULL || enc_len == 0)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     mac_data data[3] = { 0 };
@@ -588,7 +562,7 @@ int sdcpcli_mac_identity(
     if (nonce == NULL || nonce_len == 0 ||
         id == NULL || id_len == 0)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     mac_data data[2] = { 0 };
@@ -612,7 +586,7 @@ int sdcpcli_verify_enrollment_mac(
     if (nonce == NULL || nonce_len == 0 ||
         mac == NULL || mac_len < SDCP_DIGEST_SIZE_V1)
     {
-        return MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     mac_data data[1] = { 0 };
@@ -632,7 +606,7 @@ int sdcpcli_verify_enrollment_mac(
         diff |= mac[i] ^ verify_mac[i];
     }
 
-    return diff == 0 ? 0 : MBEDTLS_ERR_MD_BAD_INPUT_DATA;
+    return diff == 0 ? 0 : PSA_ERROR_INVALID_ARGUMENT;
 }
 
 static int generate_iv(
@@ -643,28 +617,31 @@ static int generate_iv(
     if (keys == NULL || iv_seed == NULL ||
         iv == NULL || iv_len < SDCP_ENCRYPTION_BLOCK_SIZE_V1)
     {
-        return MBEDTLS_ERR_CIPHER_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     int err = 0;
     const char iv_label[] = "iv";
     uint32_t seed = big_endian32(*iv_seed++);
+    size_t olen = 0;
 
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
+    psa_key_id_t hmac_key = PSA_KEY_ID_NULL;
+    psa_mac_operation_t op = PSA_MAC_OPERATION_INIT;
+    uint8_t mac[SDCP_DIGEST_SIZE_V1] = { 0 };
 
-    MBEDTLS_CHK(mbedtls_md_setup(
-        &ctx,
-        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-        1)); // HMAC
+    MBEDTLS_CHK(import_hmac_key(keys->s, sizeof(keys->s), &hmac_key));
 
-    MBEDTLS_CHK(mbedtls_md_hmac_starts(&ctx, keys->s, sizeof(keys->s)));
-    MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, (const uint8_t*)iv_label, strlen(iv_label) + 1));
-    MBEDTLS_CHK(mbedtls_md_hmac_update(&ctx, (const uint8_t*)&seed, sizeof(seed)));
-    MBEDTLS_CHK(mbedtls_md_hmac_finish(&ctx, iv));
+    MBEDTLS_CHK(psa_mac_sign_setup(&op, hmac_key, PSA_ALG_HMAC(PSA_ALG_SHA_256)));
+    MBEDTLS_CHK(psa_mac_update(&op, (const uint8_t*)iv_label, strlen(iv_label) + 1));
+    MBEDTLS_CHK(psa_mac_update(&op, (const uint8_t*)&seed, sizeof(seed)));
+    MBEDTLS_CHK(psa_mac_sign_finish(&op, mac, sizeof(mac), &olen));
+
+    // The IV is the leading block of the HMAC output.
+    memcpy(iv, mac, SDCP_ENCRYPTION_BLOCK_SIZE_V1);
 
 exit:
-    mbedtls_md_free(&ctx);
+    psa_mac_abort(&op);
+    psa_destroy_key(hmac_key);
 
     return err;
 }
@@ -681,44 +658,48 @@ int sdcpcli_encrypt_sample(
         iv == NULL || iv_len < SDCP_ENCRYPTION_BLOCK_SIZE_V1 ||
         enc == NULL || enc_olen == NULL)
     {
-        return MBEDTLS_ERR_CIPHER_BAD_INPUT_DATA;
+        return PSA_ERROR_INVALID_ARGUMENT;
     }
 
     if (enc_len < sample_len + SDCP_ENCRYPTION_BLOCK_SIZE_V1)
     {
         *enc_olen = sample_len + SDCP_ENCRYPTION_BLOCK_SIZE_V1;
-        return MBEDTLS_ERR_ECP_BUFFER_TOO_SMALL;
+        return PSA_ERROR_BUFFER_TOO_SMALL;
     }
 
     int err = 0;
+    size_t update_len = 0;
+    size_t finish_len = 0;
+    // AES-256-CBC with PKCS#7 padding, the mbedtls 2.x cipher module default.
+    const psa_algorithm_t alg = PSA_ALG_CBC_PKCS7;
 
-    mbedtls_cipher_context_t ctx;
-    mbedtls_cipher_init(&ctx);
+    psa_key_id_t key = PSA_KEY_ID_NULL;
+    psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
 
-    uint8_t iv_copy[SDCP_ENCRYPTION_BLOCK_SIZE_V1] = { 0 };
-
-    MBEDTLS_CHK(mbedtls_cipher_setup(
-        &ctx,
-        mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_256_CBC)));
-
-    assert(mbedtls_cipher_get_key_bitlen(&ctx) == sizeof(keys->k) * CHAR_BIT);
-    MBEDTLS_CHK(mbedtls_cipher_setkey(
-        &ctx,
-        keys->k, sizeof(keys->k) * CHAR_BIT,
-        MBEDTLS_ENCRYPT));
+    MBEDTLS_CHK(import_key(
+        PSA_KEY_TYPE_AES,
+        sizeof(keys->k) * CHAR_BIT,
+        keys->k, sizeof(keys->k),
+        PSA_KEY_USAGE_ENCRYPT, alg,
+        &key));
 
     MBEDTLS_CHK(generate_iv(keys, iv_seed, iv, iv_len));
-    memcpy(iv_copy, iv, sizeof(iv_copy));
 
-    *enc_olen = enc_len;
-    MBEDTLS_CHK(mbedtls_cipher_crypt(
-        &ctx,
-        iv_copy, sizeof(iv_copy),
+    MBEDTLS_CHK(psa_cipher_encrypt_setup(&op, key, alg));
+    MBEDTLS_CHK(psa_cipher_set_iv(&op, iv, SDCP_ENCRYPTION_BLOCK_SIZE_V1));
+    MBEDTLS_CHK(psa_cipher_update(
+        &op,
         sample, sample_len,
-        enc, enc_olen));
+        enc, enc_len, &update_len));
+    MBEDTLS_CHK(psa_cipher_finish(
+        &op,
+        enc + update_len, enc_len - update_len, &finish_len));
+
+    *enc_olen = update_len + finish_len;
 
 exit:
-    mbedtls_cipher_free(&ctx);
+    psa_cipher_abort(&op);
+    psa_destroy_key(key);
 
     return err;
 }
