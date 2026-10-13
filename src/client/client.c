@@ -23,7 +23,9 @@ static void secure_zero_memory(void* ptr, size_t len)
 static uint32_t big_endian32(uint32_t x)
 {
     uint32_t x_be = x;
-#ifndef BIG_ENDIAN
+// glibc defines BIG_ENDIAN as a constant on every platform, so test the
+// compiler's byte order instead. MSVC targets are little-endian.
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     x_be = (x_be & 0x0000ffff) << 16 | (x_be & 0xffff0000) >> 16;
     x_be = (x_be & 0x00ff00ff) <<  8 | (x_be & 0xff00ff00) >>  8;
 #endif
