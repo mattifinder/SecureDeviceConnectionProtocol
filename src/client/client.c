@@ -595,13 +595,19 @@ int sdcpcli_verify_enrollment_mac(
     data[0].ptr = nonce;
     data[0].len = nonce_len;
 
+    // A failed HMAC leaves verify_mac zeroed, so the comparison below would
+    // accept an all-zero MAC.
     uint8_t verify_mac[SDCP_DIGEST_SIZE_V1] = { 0 };
-    mac_with_label(
+    int err = mac_with_label(
         keys,
         SDCP_LABEL_ENROLL,
         data, sizeof(data) / sizeof(data[0]),
         verify_mac, sizeof(verify_mac));
-    
+    if (err != 0)
+    {
+        return err;
+    }
+
     int diff = 0;
     for (size_t i = 0; i < sizeof(verify_mac); i++)
     {
@@ -624,7 +630,8 @@ static int generate_iv(
 
     int err = 0;
     const char iv_label[] = "iv";
-    uint32_t seed = big_endian32(*iv_seed++);
+    // Advance the caller's counter so that every sample gets a fresh IV.
+    uint32_t seed = big_endian32((*iv_seed)++);
     size_t olen = 0;
 
     psa_key_id_t hmac_key = PSA_KEY_ID_NULL;

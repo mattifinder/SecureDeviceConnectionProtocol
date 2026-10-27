@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <string.h>
 
 #include "sdcpclient.h"
 #include "testkeys.h"
@@ -130,6 +131,37 @@ int main()
         host_random, sizeof(host_random),
         mac, sizeof(mac)));
     print_bytes("m", mac, sizeof(mac));
+
+    // Enrollment: the device checks the host's MAC over its nonce. Without
+    // keys the check must fail, even for an all-zero MAC.
+    puts("\nEnrollment MAC:\n---------------\n");
+    uint8_t enroll_nonce[SDCP_RANDOM_SIZE_V1] = { 0 };
+    ASSERT_EQUAL(0, sdcpcli_gen_rand(enroll_nonce, sizeof(enroll_nonce)));
+    uint8_t zero_mac[SDCP_DIGEST_SIZE_V1] = { 0 };
+    assert(sdcpcli_verify_enrollment_mac(
+        NULL,
+        enroll_nonce, sizeof(enroll_nonce),
+        zero_mac, sizeof(zero_mac)) != 0);
+    puts("rejected without keys");
+
+    // Sample encryption: each call must use a new IV.
+    puts("\nSample encryption:\n------------------\n");
+    uint32_t iv_seed = 0;
+    const uint8_t sample[] = { 's', 'a', 'm', 'p', 'l', 'e' };
+    uint8_t iv1[SDCP_ENCRYPTION_BLOCK_SIZE_V1] = { 0 };
+    uint8_t iv2[SDCP_ENCRYPTION_BLOCK_SIZE_V1] = { 0 };
+    uint8_t enc[sizeof(sample) + SDCP_ENCRYPTION_BLOCK_SIZE_V1] = { 0 };
+    size_t enc_len = 0;
+    ASSERT_EQUAL(0, sdcpcli_encrypt_sample(
+        &app_keys, &iv_seed, sample, sizeof(sample),
+        iv1, sizeof(iv1), enc, sizeof(enc), &enc_len));
+    ASSERT_EQUAL(0, sdcpcli_encrypt_sample(
+        &app_keys, &iv_seed, sample, sizeof(sample),
+        iv2, sizeof(iv2), enc, sizeof(enc), &enc_len));
+    ASSERT_EQUAL(2u, iv_seed);
+    assert(memcmp(iv1, iv2, sizeof(iv1)) != 0);
+    print_bytes("iv1", iv1, sizeof(iv1));
+    print_bytes("iv2", iv2, sizeof(iv2));
 
     return 0;
 }
