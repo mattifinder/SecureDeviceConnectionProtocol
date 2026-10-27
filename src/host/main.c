@@ -30,6 +30,9 @@ static void usage(FILE* out)
         "  --finger-timeout MS     how long identify waits for a finger (default %d)\n"
         "  --session PATH          save the session after connect, load it for reconnect\n"
         "  --ca PATH               trusted roots (PEM/DER) for the model certificate\n"
+        "  --strict-validity       with --ca, also fail on expired certificates\n"
+        "  --legacy-model          also accept the 2018 model certificate\n"
+        "  --any-model-cert        accept model certificates the Windows adapter does not\n"
         "  --expect-fw-hash HEX    required firmware hash h_f (64 hex digits)\n"
         "  --mock                  talk to a simulated device instead of USB\n"
         "  --mock-tamper FIELD     make the mock corrupt: mac, model-sig, device-sig\n"
@@ -78,7 +81,7 @@ int main(int argc, char** argv)
         SDCP_USB_DEFAULT_EP_OUT, SDCP_USB_DEFAULT_EP_IN, SDCP_USB_DEFAULT_TIMEOUT,
         SDCP_USB_DEFAULT_FINGER_TIMEOUT
     };
-    sdcp_host_options opt = { NULL, NULL, stdout };
+    sdcp_host_options opt = { .log = stdout };
     int verbose = 0;
     const char* session_path = NULL;
     int mock = 0;
@@ -86,7 +89,8 @@ int main(int argc, char** argv)
     uint8_t expected_h_f[SDCP_DIGEST_SIZE_V1];
 
     enum { OPT_VID = 256, OPT_PID, OPT_INTERFACE, OPT_EP_OUT, OPT_EP_IN, OPT_TIMEOUT, OPT_FINGER_TIMEOUT,
-        OPT_SESSION, OPT_CA, OPT_FW_HASH, OPT_MOCK, OPT_MOCK_TAMPER };
+        OPT_SESSION, OPT_CA, OPT_STRICT_VALIDITY, OPT_LEGACY_MODEL, OPT_ANY_MODEL_CERT,
+        OPT_FW_HASH, OPT_MOCK, OPT_MOCK_TAMPER };
     static const struct option long_options[] = {
         { "vid", required_argument, NULL, OPT_VID },
         { "pid", required_argument, NULL, OPT_PID },
@@ -97,6 +101,9 @@ int main(int argc, char** argv)
         { "finger-timeout", required_argument, NULL, OPT_FINGER_TIMEOUT },
         { "session", required_argument, NULL, OPT_SESSION },
         { "ca", required_argument, NULL, OPT_CA },
+        { "strict-validity", no_argument, NULL, OPT_STRICT_VALIDITY },
+        { "legacy-model", no_argument, NULL, OPT_LEGACY_MODEL },
+        { "any-model-cert", no_argument, NULL, OPT_ANY_MODEL_CERT },
         { "expect-fw-hash", required_argument, NULL, OPT_FW_HASH },
         { "mock", no_argument, NULL, OPT_MOCK },
         { "mock-tamper", required_argument, NULL, OPT_MOCK_TAMPER },
@@ -144,6 +151,15 @@ int main(int argc, char** argv)
         case OPT_CA:
             opt.ca_path = optarg;
             break;
+        case OPT_STRICT_VALIDITY:
+            opt.strict_validity = 1;
+            break;
+        case OPT_LEGACY_MODEL:
+            opt.allow_legacy_model = 1;
+            break;
+        case OPT_ANY_MODEL_CERT:
+            opt.any_model_cert = 1;
+            break;
         case OPT_FW_HASH:
             if (parse_hex_bytes(optarg, expected_h_f, sizeof(expected_h_f)) != 0)
             {
@@ -183,6 +199,9 @@ int main(int argc, char** argv)
         usage(stderr);
         return 2;
     }
+
+    // The simulated device sends its model public key instead of a certificate.
+    opt.allow_raw_model_key = mock;
 
     for (int i = optind; i < argc; i++)
     {

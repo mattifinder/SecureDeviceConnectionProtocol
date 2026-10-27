@@ -22,6 +22,19 @@ typedef struct {
     // If set, the firmware hash must match.
     const uint8_t* expected_h_f;
     FILE* log;
+    // By default the model certificate must be one of the leaves the Windows
+    // adapter accepts (modelcerts.c). This accepts any certificate instead.
+    int any_model_cert;
+    // Also accept the 2018 model certificate, as the adapter does when its
+    // AutoDetect registry value is set.
+    int allow_legacy_model;
+    // Accept a bare 65-byte model public key in place of a certificate, as
+    // sent by the simulated device.
+    int allow_raw_model_key;
+    // Fail chain validation for certificates outside their validity period.
+    // Off by default: the VeriMark's RTS5816 leaf expired on 2025-08-16 and
+    // Windows still accepts the device.
+    int strict_validity;
 } sdcp_host_options;
 
 typedef enum {
@@ -30,6 +43,7 @@ typedef enum {
     SDCP_HOST_ERR_VERIFY = -2,    // A MAC, signature or certificate check failed.
     SDCP_HOST_ERR_CRYPTO = -3,
     SDCP_HOST_ERR_NO_SESSION = -4,
+    SDCP_HOST_NO_MATCH = -5,      // The device did not match the finger.
 } sdcp_host_result;
 
 sdcp_host_result sdcp_host_connect(

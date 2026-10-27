@@ -61,8 +61,13 @@ int sdcp_split_claim(const uint8_t* claim, size_t claim_len, sdcp_connect_respon
 {
     reader r = { claim, claim_len };
 
-    resp->cert_len = der_sequence_len(claim, claim_len);
-    if (resp->cert_len == 0 ||
+    if (claim_len <= SDCP_CLAIM_FIXED_SIZE_V1)
+    {
+        return -1;
+    }
+
+    resp->cert_len = claim_len - SDCP_CLAIM_FIXED_SIZE_V1;
+    if (der_sequence_len(claim, resp->cert_len) != resp->cert_len ||
         (resp->cert = take(&r, resp->cert_len)) == NULL ||
         (resp->pk_d = take(&r, SDCP_PUBLIC_KEY_SIZE_V1)) == NULL ||
         (resp->pk_f = take(&r, SDCP_PUBLIC_KEY_SIZE_V1)) == NULL ||

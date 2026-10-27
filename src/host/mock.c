@@ -122,6 +122,8 @@ static int mock_identify(
         return -1;
     }
 
+    identity->matched = 1;
+    identity->sub_factor = 2; // right index finger
     memcpy(identity->id, ctx->enrollment_id, sizeof(identity->id));
     if (sdcpcli_mac_identity(
             &ctx->keys,

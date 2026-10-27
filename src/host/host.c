@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "host.h"
+#include "modelcerts.h"
 #include "sdcpclient.h"
 
 static const char session_magic[8] = { 'S', 'D', 'C', 'P', 'S', 'E', 'S', '1' };
@@ -56,12 +57,64 @@ const char* sdcp_host_result_str(sdcp_host_result r)
     case SDCP_HOST_ERR_VERIFY: return "verification failed";
     case SDCP_HOST_ERR_CRYPTO: return "crypto error";
     case SDCP_HOST_ERR_NO_SESSION: return "no session; connect first";
+    case SDCP_HOST_NO_MATCH: return "no match";
     }
     return "unknown error";
 }
 
-// Extracts pk_m from cert_m, optionally validating its chain. As in sdcptest,
-// a bare 65-byte SEC1 point is accepted in place of a certificate.
+// WINBIO_BIOMETRIC_SUBTYPE values for fingerprints (ANSI 381 positions).
+static const char* sub_factor_str(uint8_t sub_factor)
+{
+    static const char* fingers[] = {
+        "unknown", "right thumb", "right index", "right middle", "right ring", "right little",
+        "left thumb", "left index", "left middle", "left ring", "left little"
+    };
+    if (sub_factor < sizeof(fingers) / sizeof(fingers[0]))
+    {
+        return fingers[sub_factor];
+    }
+    return sub_factor == 0xff ? "any" : "unknown";
+}
+
+// WINBIO_REJECT_DETAIL values for fingerprints.
+static const char* reject_detail_str(uint32_t detail)
+{
+    static const char* details[] = {
+        "none", "too high", "too low", "too left", "too right", "too fast",
+        "too slow", "poor quality", "too skewed", "too short", "merge failure"
+    };
+    if (detail < sizeof(details) / sizeof(details[0]))
+    {
+        return details[detail];
+    }
+    return "unknown";
+}
+
+// Returns the accepted chain whose leaf is cert_m, or NULL. Like the Windows
+// adapter, the leaf must match byte for byte.
+static const sdcp_model_chain* find_model_chain(
+    const sdcp_connect_response* data,
+    const sdcp_host_options* opt)
+{
+    for (size_t i = 0; i < g_sdcp_model_chain_count; i++)
+    {
+        const sdcp_model_chain* chain = &g_sdcp_model_chains[i];
+        if (chain->legacy && !opt->allow_legacy_model)
+        {
+            continue;
+        }
+        if (chain->leaf_len == data->cert_len &&
+            memcmp(chain->leaf, data->cert, chain->leaf_len) == 0)
+        {
+            return chain;
+        }
+    }
+    return NULL;
+}
+
+// Extracts pk_m from cert_m. The certificate must be one the Windows adapter
+// accepts unless any_model_cert is set; with ca_path its chain is validated,
+// using the intermediates from modelcerts.c for a pinned leaf.
 static sdcp_host_result model_key_from_cert(
     const sdcp_connect_response* data,
     const sdcp_host_options* opt,
@@ -70,9 +123,9 @@ static sdcp_host_result model_key_from_cert(
     if (data->cert_len == SDCP_PUBLIC_KEY_SIZE_V1 &&
         data->cert[0] == SEC1_UNCOMPRESSED_POINT_HEADER)
     {
-        if (opt->ca_path != NULL)
+        if (!opt->allow_raw_model_key)
         {
-            fprintf(opt->log, "error: device sent a raw public key, not a certificate; cannot validate against %s\n", opt->ca_path);
+            fprintf(opt->log, "error: device sent a raw public key instead of a model certificate\n");
             return SDCP_HOST_ERR_VERIFY;
         }
         fprintf(opt->log, "warning: model certificate is a raw public key; not validated\n");
@@ -91,6 +144,21 @@ static sdcp_host_result model_key_from_cert(
     psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
     mbedtls_svc_key_id_t key = MBEDTLS_SVC_KEY_ID_INIT;
 
+    const sdcp_model_chain* pinned = find_model_chain(data, opt);
+    if (pinned != NULL)
+    {
+        fprintf(opt->log, "model certificate: %s, accepted by the Windows adapter\n", pinned->name);
+    }
+    else if (opt->any_model_cert)
+    {
+        fprintf(opt->log, "warning: model certificate is not one the Windows adapter accepts\n");
+    }
+    else
+    {
+        fprintf(opt->log, "FAIL: model certificate is not one the Windows adapter accepts (see --any-model-cert)\n");
+        goto exit;
+    }
+
     if (mbedtls_x509_crt_parse_der(&chain, data->cert, data->cert_len) != 0)
     {
         fprintf(opt->log, "error: model certificate is not valid DER X.509\n");
@@ -106,23 +174,38 @@ static sdcp_host_result model_key_from_cert(
     {
         uint32_t flags = 0;
 
-        // The device sends only the leaf; intermediates belong in ca_path.
+        // The device sends only the leaf. For a pinned leaf, add the
+        // intermediates the adapter would; otherwise they must be in ca_path.
+        if (pinned != NULL &&
+            (mbedtls_x509_crt_parse_der(&chain, pinned->ca1, pinned->ca1_len) != 0 ||
+             mbedtls_x509_crt_parse_der(&chain, pinned->ca2, pinned->ca2_len) != 0))
+        {
+            fprintf(opt->log, "error: could not parse the built-in intermediate certificates\n");
+            goto exit;
+        }
+
         if (mbedtls_x509_crt_parse_file(&trusted, opt->ca_path) < 0)
         {
             fprintf(opt->log, "error: could not load trusted roots from %s\n", opt->ca_path);
             goto exit;
         }
 
+        const uint32_t validity = MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE;
         if (mbedtls_x509_crt_verify(&chain, &trusted, NULL, NULL, &flags, NULL, NULL) != 0)
         {
             char info[512] = { 0 };
             mbedtls_x509_crt_verify_info(info, sizeof(info), "  ", flags);
-            fprintf(opt->log, "error: model certificate chain is not trusted:\n%s", info);
-            goto exit;
+            if (opt->strict_validity || (flags & ~validity) != 0)
+            {
+                fprintf(opt->log, "FAIL: model certificate chain is not trusted:\n%s", info);
+                goto exit;
+            }
+            fprintf(opt->log, "warning: model certificate chain is trusted but outside its validity period"
+                " (ignored, as on Windows; see --strict-validity):\n%s", info);
         }
-        fprintf(opt->log, "model certificate chain: trusted\n");
+        fprintf(opt->log, "ok: model certificate chain\n");
     }
-    else
+    else if (pinned == NULL)
     {
         fprintf(opt->log, "warning: no --ca given; model certificate chain not validated\n");
     }
@@ -186,6 +269,13 @@ sdcp_host_result sdcp_host_connect(
     sdcp_print_bytes(log, "pk_f", data.pk_f, SDCP_PUBLIC_KEY_SIZE_V1);
     sdcp_print_bytes(log, "h_f", data.h_f, SDCP_DIGEST_SIZE_V1);
 
+    // The Windows adapter checks the model certificate before anything else.
+    uint8_t pk_m[SDCP_PUBLIC_KEY_SIZE_V1] = { 0 };
+    if ((result = model_key_from_cert(&data, opt, pk_m)) != SDCP_HOST_OK)
+    {
+        goto exit;
+    }
+
     // ms <- KDF(ECDH(sk_h, pk_f), "master secret", r_h||r_d)
     // (s, k) <- KDF(ms, "application keys")
     result = SDCP_HOST_ERR_CRYPTO;
@@ -230,12 +320,6 @@ sdcp_host_result sdcp_host_connect(
     fprintf(log, "ok: claim MAC\n");
 
     // Verify(pk_m, H(pk_d), s_m)
-    uint8_t pk_m[SDCP_PUBLIC_KEY_SIZE_V1] = { 0 };
-    if ((result = model_key_from_cert(&data, opt, pk_m)) != SDCP_HOST_OK)
-    {
-        goto exit;
-    }
-
     uint8_t hash[SDCP_DIGEST_SIZE_V1] = { 0 };
     result = SDCP_HOST_ERR_VERIFY;
     if (sdcpcli_hash(data.pk_d, SDCP_PUBLIC_KEY_SIZE_V1, hash, sizeof(hash)) != 0 ||
@@ -348,10 +432,21 @@ sdcp_host_result sdcp_host_identify(
         return SDCP_HOST_ERR_CRYPTO;
     }
 
+    memset(identity, 0, sizeof(*identity));
     if (t->identify(t, nonce, sizeof(nonce), identity) != 0)
     {
         return SDCP_HOST_ERR_TRANSPORT;
     }
+
+    if (!identity->matched)
+    {
+        if (identity->reject_detail != 0)
+        {
+            fprintf(opt->log, "capture rejected: %s\n", reject_detail_str(identity->reject_detail));
+        }
+        return SDCP_HOST_NO_MATCH;
+    }
+    fprintf(opt->log, "matched finger: %s\n", sub_factor_str(identity->sub_factor));
 
     // m == MAC(s, "identify"||n||id)
     if (sdcpcli_mac_identity(

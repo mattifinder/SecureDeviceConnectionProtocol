@@ -31,7 +31,12 @@
 #define VM_CMD_MATCH            0x08 // IN
 #define VM_CMD_ENROLLMENTS      0x0e // IN
 #define VM_CMD_IDENTIFY_NONCE   0x0b // OUT: n
-#define VM_CMD_IDENTIFY_RESULT  0x0c // IN:  code || ? || id || m || trailer
+#define VM_CMD_IDENTIFY_RESULT  0x0c // IN:  status || sub_factor || id || m || trailer
+
+// Identify status codes, as the Windows adapter maps them.
+#define VM_IDENTIFY_MATCH         0x00
+#define VM_IDENTIFY_NO_MATCH      0x0b
+#define VM_IDENTIFY_REJECT_SKEWED 0x0c
 #define VM_CMD_CAPTURE_END      0x11
 
 // Response sizes the Windows driver requests.
@@ -263,22 +268,34 @@ static int vm_identify(
         goto exit;
     }
 
-    // code(1) || unknown(1) || id(32) || m(32) || trailer(8). The meaning of
-    // the second byte and the trailer is unknown; neither is MACed.
+    // status(1) || sub_factor(1) || id(32) || m(32) || trailer(8), decoded as
+    // in Realtek's WinBio adapter. Neither the sub-factor nor the trailer is
+    // MACed; the adapter keeps the trailer but its meaning is unknown.
     if (got < 2 + 2 * SDCP_DIGEST_SIZE_V1)
     {
         fprintf(t->log, "device: identify result too short (%zu bytes)\n", got);
         goto exit;
     }
-    if (result[0] != 0)
-    {
-        fprintf(t->log, "device: no match (result code %02x)\n", result[0]);
-        goto exit;
-    }
 
-    memcpy(identity->id, result + 2, SDCP_DIGEST_SIZE_V1);
-    memcpy(identity->mac, result + 2 + SDCP_DIGEST_SIZE_V1, SDCP_DIGEST_SIZE_V1);
     err = 0;
+    switch (result[0])
+    {
+    case VM_IDENTIFY_MATCH:
+        identity->matched = 1;
+        identity->sub_factor = result[1];
+        memcpy(identity->id, result + 2, SDCP_DIGEST_SIZE_V1);
+        memcpy(identity->mac, result + 2 + SDCP_DIGEST_SIZE_V1, SDCP_DIGEST_SIZE_V1);
+        break;
+    case VM_IDENTIFY_NO_MATCH:
+        break;
+    case VM_IDENTIFY_REJECT_SKEWED:
+        identity->reject_detail = 8; // WINBIO_FP_TOO_SKEWED
+        break;
+    default:
+        // The adapter passes other codes on as the reject detail.
+        identity->reject_detail = result[0];
+        break;
+    }
 
 exit:
     t->verbose = verbose;
